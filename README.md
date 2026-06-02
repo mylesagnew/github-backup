@@ -1,5 +1,7 @@
 # github-backup
 
+![github-backup logo](github-backup.png)
+
 A Bash script that snapshots every GitHub repository owned by an account, compresses them into a dated archive, and automatically rotates archives older than 90 days.
 
 ## Features
