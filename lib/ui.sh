@@ -37,6 +37,7 @@ EOF
 
 # Numbered menu — sets global CHOSEN_IDX (0-based).
 # Usage: choose_from "Title" "Option A" "Option B" ...
+# shellcheck disable=SC2034  # used by sourcing scripts after choose_from returns
 CHOSEN_IDX=0
 choose_from() {
   local title="$1"; shift
@@ -52,6 +53,7 @@ choose_from() {
     prompt "Enter choice [1-${#items[@]}]:"
     read -r choice
     if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#items[@]}" ]]; then
+      # shellcheck disable=SC2034  # read by sourcing scripts after this function returns
       CHOSEN_IDX=$(( choice - 1 ))
       return
     fi
