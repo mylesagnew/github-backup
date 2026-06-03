@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lib/restore_engine.sh — core restore loop
-# Requires: GITHUB_USER, GITHUB_TOKEN, RESTORE_ROOT, MODE, FORCE, DRY_RUN,
+# Requires: GITHUB_USER, RESTORE_ROOT, MODE, FORCE, DRY_RUN,
 #           FILTER_REPOS (array), LOG_FILE, and functions from ui.sh,
 #           github_api.sh, and archive.sh.
 
@@ -14,23 +14,24 @@ run_restore() {
   log "Dry-run : ${DRY_RUN}"
   log "======================================================"
 
-  # Extract into a private temp dir inside RESTORE_ROOT
   local work_dir
   work_dir=$(mktemp -d "${RESTORE_ROOT}/restore-XXXXXX")
   # shellcheck disable=SC2064
-  trap "log 'Cleaning up ${work_dir}'; rm -rf '${work_dir}'" EXIT
+  trap "log 'Cleaning up temp dir'; rm -rf '${work_dir}'" EXIT
+
+  # Always extract into the private temp dir — needed to enumerate repos.
+  # In dry-run mode, no content is written to RESTORE_ROOT or GitHub.
+  extract_archive "$archive" "$work_dir"
 
   if $DRY_RUN; then
-    warn "[DRY-RUN] would extract: $(basename "$archive")"
-  else
-    extract_archive "$archive" "$work_dir"
+    warn "DRY-RUN: archive extracted to temp workspace only; no GitHub or local writes will occur"
   fi
 
-  # Locate repos — archive may wrap everything in one top-level dir
+  # Locate repos — archive may wrap everything in one top-level directory
   local repos_dir="$work_dir"
-  local subdirs=("${work_dir}"/*/); subdirs=("${subdirs[@]%/}")
-  if [[ ${#subdirs[@]} -eq 1 && -d "${subdirs[0]}" \
-        && ! "${subdirs[0]}" =~ \.git$ ]]; then
+  local subdirs
+  mapfile -t subdirs < <(find "$work_dir" -mindepth 1 -maxdepth 1 -type d ! -name "*.git")
+  if [[ ${#subdirs[@]} -eq 1 ]]; then
     repos_dir="${subdirs[0]}"
   fi
 
@@ -43,44 +44,62 @@ run_restore() {
   local total=0 skipped=0 failed=0 pushed=0
 
   for repo_dir in "${repo_dirs[@]}"; do
-    local repo_name; repo_name=$(basename "$repo_dir" .git)
+    local dir_name repo_name target_owner
+    dir_name=$(basename "$repo_dir" .git)
 
-    # Apply filter list if repos were selected individually
+    # Detect org__repo naming written by github-backup.sh for org repos
+    if [[ "$dir_name" == *"__"* ]]; then
+      target_owner="${dir_name%%__*}"
+      repo_name="${dir_name#*__}"
+    else
+      target_owner="$GITHUB_USER"
+      repo_name="$dir_name"
+    fi
+
+    # Apply filter list (filters on repo_name only, not owner prefix)
     if [[ ${#FILTER_REPOS[@]} -gt 0 ]]; then
       local match=false
+      local f
       for f in "${FILTER_REPOS[@]}"; do
-        [[ "$f" == "$repo_name" ]] && match=true && break
+        [[ "$f" == "$repo_name" || "$f" == "$dir_name" ]] && match=true && break
       done
       if ! $match; then
-        log "Skipping ${repo_name} (not selected)"
+        log "Skipping ${dir_name} (not selected)"
         (( skipped++ )) || true
         continue
       fi
     fi
 
     (( total++ )) || true
-    printf "\n${BOLD}  ── %s ${DIM}(%d)${RESET}\n" "$repo_name" "$total"
+    printf '\n%s  ── %s %s(%d)%s\n' "$BOLD" "$dir_name" "$DIM" "$total" "$RESET"
 
-    # ── local-only mode ──────────────────────────────────────────────────────
-    if [[ "$MODE" == "local" ]]; then
-      local dest="${RESTORE_ROOT}/${repo_name}.git"
-      if $DRY_RUN; then
-        warn "[DRY-RUN] would copy bare mirror to ${dest}"
-      else
-        copy_mirror "$repo_dir" "$dest"
-        success "Saved to ${dest}"
-        info "Clone with: git clone ${dest}"
-      fi
+    # ── Dry-run short-circuit: enumerate only, no writes ─────────────────────
+    if $DRY_RUN; then
+      case "$MODE" in
+        local) warn "[DRY-RUN] would copy ${dir_name} → ${RESTORE_ROOT}/${dir_name}.git" ;;
+        push)  warn "[DRY-RUN] would push ${dir_name} → github.com/${target_owner}/${repo_name}" ;;
+        both)  warn "[DRY-RUN] would push ${dir_name} → github.com/${target_owner}/${repo_name} and copy locally" ;;
+      esac
+      (( pushed++ )) || true
       continue
     fi
 
-    # ── push (or both) mode ──────────────────────────────────────────────────
+    # ── Local-only mode ───────────────────────────────────────────────────────
+    if [[ "$MODE" == "local" ]]; then
+      local dest="${RESTORE_ROOT}/${dir_name}.git"
+      copy_mirror "$repo_dir" "$dest"
+      success "Saved to ${dest}"
+      info "Clone with: git clone ${dest}"
+      continue
+    fi
+
+    # ── Push (or both) mode ───────────────────────────────────────────────────
     if repo_exists_on_github "$repo_name"; then
       if ! $FORCE; then
-        warn "${repo_name} already exists — skipping (use force-push to overwrite)"
+        warn "${repo_name} already exists on GitHub — skipping (enable force-push to overwrite)"
         (( skipped++ )) || true
         if [[ "$MODE" == "both" ]]; then
-          _save_local "$repo_name" "$repo_dir"
+          _save_local "$dir_name" "$repo_dir"
         fi
         continue
       fi
@@ -89,7 +108,7 @@ run_restore() {
       create_github_repo "$repo_name"
     fi
 
-    if push_mirror "$repo_name" "$repo_dir"; then
+    if push_mirror "$repo_name" "$repo_dir" "$target_owner"; then
       success "Pushed ${repo_name}"
       (( pushed++ )) || true
     else
@@ -97,39 +116,33 @@ run_restore() {
       (( failed++ )) || true
     fi
 
-    [[ "$MODE" == "both" ]] && _save_local "$repo_name" "$repo_dir"
+    [[ "$MODE" == "both" ]] && _save_local "$dir_name" "$repo_dir"
   done
 
   _print_summary "$total" "$pushed" "$skipped" "$failed"
   log "Restore complete — processed=${total} pushed=${pushed} skipped=${skipped} failed=${failed}"
 }
 
-# ── Internal: save a bare mirror locally ─────────────────────────────────────
 _save_local() {
-  local repo_name="$1" repo_dir="$2"
-  local dest="${RESTORE_ROOT}/${repo_name}.git"
-  if $DRY_RUN; then
-    warn "[DRY-RUN] would copy bare mirror to ${dest}"
-  else
-    copy_mirror "$repo_dir" "$dest"
-    info "Bare mirror saved to ${dest}"
-  fi
+  local dir_name="$1" repo_dir="$2"
+  local dest="${RESTORE_ROOT}/${dir_name}.git"
+  copy_mirror "$repo_dir" "$dest"
+  info "Bare mirror saved to ${dest}"
 }
 
-# ── Internal: print final summary ────────────────────────────────────────────
 _print_summary() {
   local total="$1" pushed="$2" skipped="$3" failed="$4"
   echo ""
   hr
-  printf "${BOLD}  Restore Complete${RESET}\n\n"
-  printf "  ${DIM}Total processed :${RESET} %d\n" "$total"
-  printf "  ${GREEN}Pushed          :${RESET} %d\n" "$pushed"
-  printf "  ${YELLOW}Skipped         :${RESET} %d\n" "$skipped"
+  printf '%s  Restore Complete%s\n\n' "$BOLD" "$RESET"
+  printf '  %sTotal processed :%s %d\n' "$DIM"    "$RESET" "$total"
+  printf '  %sPushed          :%s %d\n' "$GREEN"  "$RESET" "$pushed"
+  printf '  %sSkipped         :%s %d\n' "$YELLOW" "$RESET" "$skipped"
   if [[ "$failed" -gt 0 ]]; then
-    printf "  ${RED}Failed          :${RESET} %d\n" "$failed"
+    printf '  %sFailed          :%s %d\n' "$RED" "$RESET" "$failed"
   else
-    printf "  ${DIM}Failed          :${RESET} 0\n"
+    printf '  %sFailed          :%s 0\n'  "$DIM" "$RESET"
   fi
-  printf "  ${DIM}Log             :${RESET} %s\n" "$LOG_FILE"
+  printf '  %sLog             :%s %s\n' "$DIM" "$RESET" "$LOG_FILE"
   hr
 }

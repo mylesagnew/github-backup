@@ -3,17 +3,19 @@
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 LIB_DIR="${REPO_ROOT}/lib"
 
-# Source only the lib files that don't require live network/credentials.
-# github_api.sh is excluded; tests that need its functions stub them.
+# Source ui.sh and archive.sh. github_api.sh is NOT sourced here because its
+# functions (push_mirror, create_github_repo, repo_exists_on_github) must be
+# stubbed per-test before restore_engine.sh is loaded.
+# Tests that exercise the engine source restore_engine.sh themselves after
+# defining their stubs.
 load_libs() {
-  export LOG_FILE="${BATS_TMPDIR}/test.log"
+  export LOG_FILE="${BATS_TMPDIR}/test-$$.log"
   touch "$LOG_FILE"
 
-  # Minimal env so lib files don't error on load
   export GITHUB_USER="test-user"
   export GITHUB_TOKEN="test-token"
-  export RESTORE_ROOT="${BATS_TMPDIR}/restores"
-  export BACKUP_ROOT="${BATS_TMPDIR}/backups"
+  export RESTORE_ROOT="${BATS_TMPDIR}/restores-$$"
+  export BACKUP_ROOT="${BATS_TMPDIR}/backups-$$"
   export MODE="push"
   export FORCE=false
   export DRY_RUN=false
@@ -21,7 +23,7 @@ load_libs() {
 
   mkdir -p "$RESTORE_ROOT" "$BACKUP_ROOT"
 
-  # Suppress colour codes in test output
+  # Disable ANSI codes so test output is readable
   export BOLD='' DIM='' CYAN='' GREEN='' YELLOW='' RED='' BLUE='' RESET=''
 
   source "${LIB_DIR}/ui.sh"

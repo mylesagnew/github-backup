@@ -1,70 +1,71 @@
 #!/usr/bin/env bash
-# github-backup.sh — mirror all owned GitHub repos into a dated archive
+# github-backup.sh — mirror all owned GitHub repos into a timestamped archive
 # https://github.com/mylesagnew/github-backup
 set -euo pipefail
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Locate lib dir ────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/lib"
+
+# ── Configuration (overridable via env) ───────────────────────────────────────
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/github-backups}"
 RETENTION_DAYS="${RETENTION_DAYS:-90}"
-PARALLEL_JOBS="${PARALLEL_JOBS:-4}"   # concurrent clone workers
+PARALLEL_JOBS="${PARALLEL_JOBS:-4}"
+ALLOW_PARTIAL_BACKUP="${ALLOW_PARTIAL_BACKUP:-false}"
 
-# Timestamp granularity prevents same-day overwrites
 TIMESTAMP=$(date +%Y-%m-%dT%H%M%S)
 ARCHIVE_NAME="github-backup-${GITHUB_USER}-${TIMESTAMP}.tar.gz"
 WORK_DIR="$(mktemp -d)"
 LOG_FILE="${BACKUP_ROOT}/backup.log"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
-die()  { log "ERROR: $*"; exit 1; }
-trap 'rm -rf "$WORK_DIR"' EXIT
+# ── Bootstrap logging before lib is loaded ────────────────────────────────────
+# (lib/ui.sh requires LOG_FILE; BACKUP_ROOT may not exist yet — use /tmp first)
+_BOOTSTRAP_LOG=$(mktemp)
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$_BOOTSTRAP_LOG"; }
+die() { log "ERROR: $*"; exit 1; }
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 [[ -z "$GITHUB_USER" ]]  && die "GITHUB_USER is not set"
 [[ -z "$GITHUB_TOKEN" ]] && die "GITHUB_TOKEN is not set"
+
+[[ "$GITHUB_USER" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || die "Invalid GITHUB_USER — expected alphanumeric, hyphens, dots, or underscores"
+[[ "$PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]] \
+  || die "PARALLEL_JOBS must be a positive integer (got: '${PARALLEL_JOBS}')"
+[[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] \
+  || die "RETENTION_DAYS must be a non-negative integer (got: '${RETENTION_DAYS}')"
+
 for cmd in git curl jq tar; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
+  command -v "$cmd" >/dev/null 2>&1 || die "'${cmd}' is required but not installed"
 done
 
 mkdir -p "$BACKUP_ROOT"
+
+# Redirect real log file now that BACKUP_ROOT exists; re-define log()
+cat "$_BOOTSTRAP_LOG" >> "$LOG_FILE"; rm -f "$_BOOTSTRAP_LOG"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+
+# ── Load shared library ───────────────────────────────────────────────────────
+[[ -d "$LIB_DIR" ]] || die "lib/ directory not found at ${LIB_DIR}"
+# shellcheck source=lib/ui.sh
+source "${LIB_DIR}/ui.sh"
+# shellcheck source=lib/github_api.sh
+source "${LIB_DIR}/github_api.sh"
+
+# ── Auth setup ────────────────────────────────────────────────────────────────
+setup_github_auth
+trap 'cleanup_github_auth; rm -rf "$WORK_DIR"' EXIT
+
 log "──────────────────────────────────────────────────"
 log "Starting backup for: ${GITHUB_USER}"
 log "Archive : ${BACKUP_ROOT}/${ARCHIVE_NAME}"
+log "Workers : ${PARALLEL_JOBS}"
 
-# ── GitHub API with retry ──────────────────────────────────────────────────────
-# Never embed $GITHUB_TOKEN in URLs — use an Authorization header only.
-github_get() {
-  local url="$1" attempt
-  for attempt in 1 2 3; do
-    local http_code body
-    body=$(curl -s -w "\n%{http_code}" \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "Accept: application/vnd.github+json" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$url")
-    http_code=$(tail -1 <<<"$body")
-    body=$(sed '$d' <<<"$body")
-
-    case "$http_code" in
-      200) echo "$body"; return 0 ;;
-      401) die "GitHub API: authentication failed (check GITHUB_TOKEN)" ;;
-      403)
-        local reset; reset=$(curl -sI \
-          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-          "$url" | grep -i x-ratelimit-reset | awk '{print $2}' | tr -d '\r')
-        local wait=$(( reset - $(date +%s) + 5 ))
-        [[ $wait -gt 0 && $wait -lt 3600 ]] && { log "Rate-limited; sleeping ${wait}s"; sleep "$wait"; } || sleep 60
-        ;;
-      404) die "GitHub API: not found — check GITHUB_USER" ;;
-      *)   log "API returned HTTP ${http_code} (attempt ${attempt}/3); retrying in 5s"; sleep 5 ;;
-    esac
-  done
-  die "GitHub API failed after 3 attempts: $url"
-}
-
-# ── Fetch all owned repo names (paginated) ────────────────────────────────────
+# ── Fetch all owned repos — store full_name<TAB>clone_url pairs ───────────────
+# Using full_name (e.g. "myorg/repo") ensures org-owned repos clone from the
+# correct namespace, not incorrectly from GITHUB_USER/repo.
 fetch_repos() {
   local page=1 per_page=100
   while true; do
@@ -72,63 +73,68 @@ fetch_repos() {
     response=$(github_get \
       "https://api.github.com/user/repos?affiliation=owner&per_page=${per_page}&page=${page}")
 
-    local batch
-    batch=$(jq -r '.[].name' <<<"$response")
-    [[ -z "$batch" ]] && break
+    jq -r '.[] | [.full_name, .clone_url] | @tsv' <<<"$response"
 
-    echo "$batch"
-
-    local count; count=$(jq 'length' <<<"$response")
+    local count
+    count=$(jq 'length' <<<"$response")
     (( count < per_page )) && break
     (( page++ ))
   done
 }
 
-mapfile -t REPOS < <(fetch_repos)
-TOTAL=${#REPOS[@]}
-[[ $TOTAL -eq 0 ]] && die "No repositories found (check credentials)"
+mapfile -t REPO_LINES < <(fetch_repos)
+TOTAL=${#REPO_LINES[@]}
+[[ $TOTAL -eq 0 ]] && die "No repositories found (check credentials and affiliation)"
 log "Found ${TOTAL} repositories"
 
-# ── Clone repos in parallel ───────────────────────────────────────────────────
-FAILED=0
-FAIL_NAMES=()
-
-# Worker: clone one repo; writes a flag file on failure so the parent can count
+# ── Clone each repo as a bare mirror (parallel) ───────────────────────────────
+# GIT_CONFIG_GLOBAL (set by setup_github_auth) supplies the Authorization header
+# so the token never appears in any process's argv.
+#
+# Safe archive name: owner/repo → owner__repo.git
+# (forward slash replaced by double-underscore to stay filesystem-safe)
 clone_repo() {
-  local repo_name="$1"
-  local clone_url="https://github.com/${GITHUB_USER}/${repo_name}.git"
-  local dest="${WORK_DIR}/${repo_name}.git"
-  local flag_file="${WORK_DIR}/.fail.${repo_name}"
+  local tsv_line="$1"
+  local full_name clone_url safe_name
+  full_name=$(cut -f1 <<<"$tsv_line")
+  clone_url=$(cut -f2 <<<"$tsv_line")
+  safe_name="${full_name//\//__}"
 
-  # Token passed via http.extraheader — never visible in process list or URLs
-  if git clone --mirror --quiet \
-      -c "http.https://github.com/.extraheader=Authorization: Bearer ${GITHUB_TOKEN}" \
-      "$clone_url" "$dest" 2>>"$LOG_FILE"; then
-    log "  ✓ ${repo_name}"
+  local dest="${WORK_DIR}/${safe_name}.git"
+  local flag="${WORK_DIR}/.fail.${safe_name}"
+
+  if git clone --mirror --quiet "$clone_url" "$dest" 2>>"$LOG_FILE"; then
+    log "  ✓ ${full_name}"
   else
-    log "  ✗ ${repo_name} — clone failed"
-    touch "$flag_file"
+    log "  ✗ ${full_name} — clone failed"
+    touch "$flag"
   fi
 }
 
 export -f clone_repo
-export GITHUB_USER GITHUB_TOKEN WORK_DIR LOG_FILE
+export WORK_DIR LOG_FILE   # GIT_CONFIG_GLOBAL already exported by setup_github_auth
 
 log "Cloning ${TOTAL} repos (${PARALLEL_JOBS} parallel workers) ..."
-
-# Use xargs for portable parallelism (GNU parallel not required)
-printf '%s\n' "${REPOS[@]}" \
+printf '%s\n' "${REPO_LINES[@]}" \
   | xargs -P "$PARALLEL_JOBS" -I{} bash -c 'clone_repo "$@"' _ {}
 
-# Count failures via flag files
+# ── Count failures ────────────────────────────────────────────────────────────
+FAILED=0
+FAIL_NAMES=()
 while IFS= read -r -d '' flag; do
-  repo=$(basename "$flag" | sed 's/^\.fail\.//')
-  FAIL_NAMES+=("$repo")
+  name=$(basename "$flag" | sed 's/^\.fail\.//')
+  FAIL_NAMES+=("$name")
   (( FAILED++ )) || true
 done < <(find "$WORK_DIR" -maxdepth 1 -name '.fail.*' -print0 2>/dev/null)
 
 log "Clone phase complete — failed: ${FAILED}/${TOTAL}"
-[[ ${#FAIL_NAMES[@]} -gt 0 ]] && log "  Failed repos: ${FAIL_NAMES[*]}"
+[[ ${#FAIL_NAMES[@]} -gt 0 ]] && log "  Failed: ${FAIL_NAMES[*]}"
+
+# ── Partial backup gate ───────────────────────────────────────────────────────
+if (( FAILED > 0 )) && [[ "$ALLOW_PARTIAL_BACKUP" != "true" ]]; then
+  die "${FAILED}/${TOTAL} repos failed to clone. " \
+      "Set ALLOW_PARTIAL_BACKUP=true to archive the partial result anyway."
+fi
 
 # ── Create archive ────────────────────────────────────────────────────────────
 ARCHIVE_PATH="${BACKUP_ROOT}/${ARCHIVE_NAME}"
@@ -153,9 +159,13 @@ log "Pruning archives older than ${RETENTION_DAYS} days ..."
 find "$BACKUP_ROOT" -maxdepth 1 \
   \( -name "github-backup-*.tar.gz" -o -name "github-backup-*.tar.gz.sha256" \) \
   -mtime "+${RETENTION_DAYS}" -print -delete 2>>"$LOG_FILE" \
-  | while read -r f; do log "  Deleted: $f"; done
+  | while IFS= read -r f; do log "  Deleted: ${f}"; done
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 log "Backup complete — repos: ${TOTAL}, failed: ${FAILED}, size: ${ARCHIVE_SIZE}"
-log "Current archives in ${BACKUP_ROOT}:"
-ls -lh "${BACKUP_ROOT}"/github-backup-*.tar.gz 2>/dev/null | tee -a "$LOG_FILE" || true
+log "Current archives:"
+find "$BACKUP_ROOT" -maxdepth 1 -name "github-backup-*.tar.gz" | sort -r | \
+  while IFS= read -r f; do
+    sz=$(du -sh "$f" 2>/dev/null | cut -f1)
+    log "  ${sz}  $(basename "$f")"
+  done
