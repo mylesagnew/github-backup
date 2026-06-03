@@ -1,0 +1,36 @@
+name: ShellCheck & Bats
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: "."
+          severity: warning
+          # SC2034: unused vars are expected in sourced lib files
+          # SC1091: sourced paths are resolved at runtime
+          ignore_codes: SC2034,SC1091
+
+  bats:
+    name: Bats Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bats
+        run: |
+          sudo apt-get install -y bats
+
+      - name: Run Bats test suite
+        run: bats tests/
