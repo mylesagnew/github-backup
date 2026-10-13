@@ -1,0 +1,17 @@
+# Credentials — never commit
+.env
+*.env
+!*.env.example
+
+# Backup / restore output if run from inside the repo
+github-backups/
+github-restores/
+*.tar.gz
+*.tar.gz.sha256
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -3,6 +3,8 @@
 ![github-backup logo](github-backup.png)
 
 [![ShellCheck & Bats](https://github.com/mylesagnew/github-backup/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/mylesagnew/github-backup/actions/workflows/shellcheck.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Bash](https://img.shields.io/badge/bash-4%2B-4EAA25?logo=gnu-bash&logoColor=white)
 
 A pair of Bash scripts that snapshot every GitHub repository owned by an account — including org repos — compress them into a timestamped, checksummed archive, and restore them with an interactive menu-driven wizard.
 
@@ -246,4 +248,4 @@ CI runs ShellCheck and the full Bats suite on every push and pull request. Actio
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Myles Agnew. Security issues: see [SECURITY.md](SECURITY.md).
