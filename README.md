@@ -3,6 +3,7 @@
 ![github-backup logo](github-backup.png)
 
 [![ShellCheck & Bats](https://github.com/mylesagnew/github-backup/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/mylesagnew/github-backup/actions/workflows/shellcheck.yml)
+[![Release](https://img.shields.io/github/v/release/mylesagnew/github-backup)](https://github.com/mylesagnew/github-backup/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Bash](https://img.shields.io/badge/bash-4%2B-4EAA25?logo=gnu-bash&logoColor=white)
 
